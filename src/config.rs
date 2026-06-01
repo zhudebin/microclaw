@@ -262,6 +262,9 @@ fn default_subagent_run_timeout_secs() -> u64 {
 fn default_subagent_announce() -> bool {
     true
 }
+fn default_subagent_progress_min_interval_secs() -> u64 {
+    45
+}
 fn default_subagent_max_spawn_depth() -> usize {
     1
 }
@@ -768,6 +771,10 @@ pub struct SubagentConfig {
     pub run_timeout_secs: u64,
     #[serde(default = "default_subagent_announce")]
     pub announce_to_chat: bool,
+    #[serde(default)]
+    pub fan_in_summary: bool,
+    #[serde(default = "default_subagent_progress_min_interval_secs")]
+    pub progress_min_interval_secs: u64,
     #[serde(default = "default_subagent_max_spawn_depth")]
     pub max_spawn_depth: usize,
     #[serde(default = "default_subagent_max_children_per_run")]
@@ -782,6 +789,8 @@ pub struct SubagentConfig {
     pub orchestrate_max_workers: usize,
     #[serde(default)]
     pub acp: SubagentAcpConfig,
+    #[serde(default)]
+    pub standup: SubagentStandupConfig,
 }
 
 impl Default for SubagentConfig {
@@ -791,6 +800,8 @@ impl Default for SubagentConfig {
             max_active_per_chat: default_subagent_max_active_per_chat(),
             run_timeout_secs: default_subagent_run_timeout_secs(),
             announce_to_chat: default_subagent_announce(),
+            fan_in_summary: false,
+            progress_min_interval_secs: default_subagent_progress_min_interval_secs(),
             max_spawn_depth: default_subagent_max_spawn_depth(),
             max_children_per_run: default_subagent_max_children_per_run(),
             thread_bound_routing_enabled: default_subagent_thread_bound_routing_enabled(),
@@ -798,6 +809,63 @@ impl Default for SubagentConfig {
             max_tokens_per_run: default_subagent_max_tokens_per_run(),
             orchestrate_max_workers: default_subagent_orchestrate_max_workers(),
             acp: SubagentAcpConfig::default(),
+            standup: SubagentStandupConfig::default(),
+        }
+    }
+}
+
+fn default_subagent_standup_interval_secs() -> u64 {
+    1800
+}
+
+/// Proactive task-standup: periodically post a one-line status for tasks that
+/// have been running a while. Off by default — it sends unprompted messages.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubagentStandupConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_subagent_standup_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for SubagentStandupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_subagent_standup_interval_secs(),
+        }
+    }
+}
+
+fn default_idle_checkin_idle_hours() -> u64 {
+    24
+}
+fn default_idle_checkin_min_interval_hours() -> u64 {
+    24
+}
+
+/// Proactive "long-silence" check-in: after a chat has been quiet for a while,
+/// optionally let the bot reach out IF it has something genuinely useful to say
+/// (a pending follow-up, a due reminder). OFF by default — it is outward-facing
+/// and uses an LLM call per idle chat.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdleCheckinConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Only consider a chat idle after this many hours with no messages.
+    #[serde(default = "default_idle_checkin_idle_hours")]
+    pub idle_hours: u64,
+    /// At most one check-in per chat per this many hours.
+    #[serde(default = "default_idle_checkin_min_interval_hours")]
+    pub min_interval_hours: u64,
+}
+
+impl Default for IdleCheckinConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_hours: default_idle_checkin_idle_hours(),
+            min_interval_hours: default_idle_checkin_min_interval_hours(),
         }
     }
 }
@@ -963,6 +1031,8 @@ pub struct Config {
     pub show_thinking: bool,
     #[serde(default)]
     pub subagents: SubagentConfig,
+    #[serde(default)]
+    pub idle_checkin: IdleCheckinConfig,
     #[serde(default)]
     pub a2a: A2AConfig,
 
@@ -1605,6 +1675,7 @@ impl Config {
             allow_group_slash_without_mention: false,
             show_thinking: false,
             subagents: SubagentConfig::default(),
+            idle_checkin: IdleCheckinConfig::default(),
             a2a: A2AConfig::default(),
             openai_compat_body_overrides: HashMap::new(),
             openai_compat_body_overrides_by_provider: HashMap::new(),

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -292,6 +293,7 @@ Rules:
 - IGNORE: greetings, small talk, unanswered questions, transient requests
 - Each memory < 100 characters, specific and concrete
 - Category must be exactly one of: PROFILE (user attributes/preferences), KNOWLEDGE (facts/expertise), EVENT (significant things that happened)
+- ALSO capture how the user likes to COMMUNICATE as PROFILE memories when there's a clear, repeated signal: preferred language, short vs. detailed answers, formal vs. casual tone, emoji or no emoji, wants code/links vs. prose. E.g. "prefers concise, no-fluff answers", "writes in Chinese", "likes step-by-step detail". These help the bot match the user's style.
 - If a new memory updates or supersedes an existing one, add "supersedes_id": <id> to replace it
 
 Output format — a JSON object with three fields:
@@ -360,6 +362,272 @@ pub fn spawn_reflector(state: Arc<AppState>) {
             run_reflector(&state).await;
         }
     });
+}
+
+/// Proactive task standup: periodically post a one-line status for chats whose
+/// sub-agents have been running a while. Off by default (it sends unprompted
+/// messages); heavily throttled so it never spams.
+pub fn spawn_task_standup(state: Arc<AppState>) {
+    if !state.config.subagents.standup.enabled {
+        return;
+    }
+    let interval_secs = state.config.subagents.standup.interval_secs.max(60);
+    tokio::spawn(async move {
+        info!("Task standup started (interval: {}s)", interval_secs);
+        // Per-chat last standup time, so each chat gets at most one per interval.
+        let mut last_standup: HashMap<i64, Instant> = HashMap::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            run_task_standup(&state, interval_secs, &mut last_standup).await;
+        }
+    });
+}
+
+async fn run_task_standup(
+    state: &Arc<AppState>,
+    interval_secs: u64,
+    last_standup: &mut HashMap<i64, Instant>,
+) {
+    let runs = match call_blocking(state.db.clone(), |db| db.list_active_subagent_runs()).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("task standup: failed to list active runs: {e}");
+            return;
+        }
+    };
+    if runs.is_empty() {
+        return;
+    }
+
+    // Group active runs by chat.
+    let mut by_chat: HashMap<i64, Vec<microclaw_storage::db::SubagentRunRecord>> = HashMap::new();
+    for run in runs {
+        by_chat.entry(run.chat_id).or_default().push(run);
+    }
+
+    let now = Utc::now();
+    for (chat_id, chat_runs) in by_chat {
+        // Only nudge when at least one task has been running longer than the
+        // interval — short tasks are covered by their own completion message.
+        let oldest_age_secs = chat_runs
+            .iter()
+            .filter_map(|r| chrono::DateTime::parse_from_rfc3339(&r.created_at).ok())
+            .map(|c| (now - c.with_timezone(&Utc)).num_seconds())
+            .max()
+            .unwrap_or(0);
+        if oldest_age_secs < interval_secs as i64 {
+            continue;
+        }
+        // At most one standup per chat per interval.
+        let due = last_standup
+            .get(&chat_id)
+            .map(|t| t.elapsed().as_secs() >= interval_secs)
+            .unwrap_or(true);
+        if !due {
+            continue;
+        }
+
+        let channel = chat_runs
+            .first()
+            .map(|r| r.caller_channel.clone())
+            .unwrap_or_default();
+        let message = format_standup(&chat_runs, now, interval_secs);
+        let bot_username = state.config.bot_username_for_channel(&channel);
+        match deliver_and_store_bot_message(
+            &state.channel_registry,
+            state.db.clone(),
+            &bot_username,
+            chat_id,
+            &message,
+        )
+        .await
+        {
+            Ok(_) => {
+                last_standup.insert(chat_id, Instant::now());
+            }
+            Err(e) => warn!("task standup: delivery failed for chat {chat_id}: {e}"),
+        }
+    }
+}
+
+/// Proactive long-silence check-in: after a chat has been quiet for a while,
+/// let the agent reach out IF it has something genuinely useful to say.
+/// OFF by default — outward-facing and uses an LLM call per idle chat.
+pub fn spawn_idle_checkin(state: Arc<AppState>) {
+    if !state.config.idle_checkin.enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        info!(
+            "Idle check-in started (idle_hours={}, min_interval_hours={})",
+            state.config.idle_checkin.idle_hours, state.config.idle_checkin.min_interval_hours
+        );
+        let mut last_checkin: HashMap<i64, Instant> = HashMap::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(1800));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            run_idle_checkin(&state, &mut last_checkin).await;
+        }
+    });
+}
+
+const IDLE_CHECKIN_PROMPT: &str = "[Proactive idle check-in] This chat has been quiet for a while. \
+Review what you know about this user and any pending follow-ups, due reminders, or promises you made.\n\
+- If — and ONLY if — you have something genuinely useful or kind to say right now (a due follow-up, a \
+relevant update, a gentle nudge on something they asked for), write ONE short, friendly message.\n\
+- Otherwise, reply with exactly: SKIP\n\
+Do not invent reasons to message; silence is the right default. Do not use the send_message tool — just \
+return the message text, or SKIP.";
+
+async fn run_idle_checkin(state: &Arc<AppState>, last_checkin: &mut HashMap<i64, Instant>) {
+    let idle_hours = state.config.idle_checkin.idle_hours.max(1) as i64;
+    let min_interval = Duration::from_secs(
+        state
+            .config
+            .idle_checkin
+            .min_interval_hours
+            .max(1)
+            .saturating_mul(3600),
+    );
+    let cutoff = (Utc::now() - chrono::Duration::hours(idle_hours)).to_rfc3339();
+    let chats = match call_blocking(state.db.clone(), move |db| db.list_idle_chats(&cutoff, 100))
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("idle check-in: failed to list idle chats: {e}");
+            return;
+        }
+    };
+
+    for chat_id in chats {
+        // Respect the per-chat min interval.
+        if let Some(t) = last_checkin.get(&chat_id) {
+            if t.elapsed() < min_interval {
+                continue;
+            }
+        }
+        // Skip chats with active background work — they get their own updates.
+        let active = call_blocking(state.db.clone(), move |db| {
+            db.count_active_subagent_runs_for_chat(chat_id)
+        })
+        .await
+        .unwrap_or(0);
+        if active > 0 {
+            continue;
+        }
+
+        let routing = match get_chat_routing(&state.channel_registry, state.db.clone(), chat_id)
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let response = match process_with_agent(
+            state,
+            AgentRequestContext {
+                caller_channel: &routing.channel_name,
+                chat_id,
+                chat_type: routing.conversation.as_agent_chat_type(),
+            },
+            Some(IDLE_CHECKIN_PROMPT),
+            None,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("idle check-in: agent run failed for chat {chat_id}: {e}");
+                last_checkin.insert(chat_id, Instant::now());
+                continue;
+            }
+        };
+
+        // Mark as checked-in regardless, so we don't retry every tick.
+        last_checkin.insert(chat_id, Instant::now());
+
+        let trimmed = response.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("skip") {
+            continue;
+        }
+
+        let bot_username = state.config.bot_username_for_channel(&routing.channel_name);
+        if let Err(e) = deliver_and_store_bot_message(
+            &state.channel_registry,
+            state.db.clone(),
+            &bot_username,
+            chat_id,
+            trimmed,
+        )
+        .await
+        {
+            warn!("idle check-in: delivery failed for chat {chat_id}: {e}");
+        }
+    }
+}
+
+/// One-line-per-task standup digest, like a colleague's quick status. A task
+/// that has run well past the interval without recent progress is flagged as
+/// possibly stalled.
+fn format_standup(
+    runs: &[microclaw_storage::db::SubagentRunRecord],
+    now: chrono::DateTime<Utc>,
+    interval_secs: u64,
+) -> String {
+    let n = runs.len();
+    let header = format!(
+        "🛰️ Still on it — {n} task{} running:",
+        if n == 1 { "" } else { "s" }
+    );
+    let interval = interval_secs as i64;
+    let mut lines = vec![header];
+    for r in runs {
+        let name = r
+            .label
+            .clone()
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| {
+                let snippet: String = r.task.chars().take(40).collect();
+                snippet
+            });
+        let age_secs = chrono::DateTime::parse_from_rfc3339(&r.created_at)
+            .ok()
+            .map(|c| (now - c.with_timezone(&Utc)).num_seconds().max(0));
+        let age = age_secs.map(format_duration_secs).unwrap_or_default();
+        let progress = r
+            .progress_text
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| format!(" — {p}"))
+            .unwrap_or_default();
+        // Stalled: running well past the interval with no recent progress.
+        let progress_age = r
+            .last_progress_at
+            .as_deref()
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|c| (now - c.with_timezone(&Utc)).num_seconds().max(0));
+        let stale_progress = progress_age.map(|a| a >= interval).unwrap_or(true);
+        let stalled = age_secs.map(|a| a >= 2 * interval).unwrap_or(false) && stale_progress;
+        let flag = if stalled { " ⚠️ no recent progress" } else { "" };
+        lines.push(format!("• {name} ({age}){progress}{flag}"));
+    }
+    lines.join("\n")
+}
+
+fn format_duration_secs(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 fn strip_reflector_thinking_tags(input: &str) -> String {
@@ -1023,6 +1291,88 @@ fn persist_curated_user_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_duration_secs() {
+        assert_eq!(format_duration_secs(5), "5s");
+        assert_eq!(format_duration_secs(125), "2m");
+        assert_eq!(format_duration_secs(3 * 3600 + 25 * 60), "3h25m");
+    }
+
+    #[test]
+    fn test_format_standup_uses_label_and_progress() {
+        use microclaw_storage::db::SubagentRunRecord;
+        let now = Utc::now();
+        let created = (now - chrono::Duration::seconds(630)).to_rfc3339();
+        let run = SubagentRunRecord {
+            run_id: "subrun-1".into(),
+            parent_run_id: None,
+            depth: 1,
+            chat_id: 7,
+            caller_channel: "telegram".into(),
+            task: "research competitor pricing across five vendors".into(),
+            context: String::new(),
+            status: "running".into(),
+            created_at: created,
+            started_at: None,
+            finished_at: None,
+            cancel_requested: false,
+            error_text: None,
+            result_text: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            provider: "anthropic".into(),
+            model: "claude-test".into(),
+            token_budget: 0,
+            artifact_json: None,
+            label: Some("competitor research".into()),
+            progress_text: Some("checked 3/5 vendors".into()),
+            last_progress_at: None,
+        };
+        let out = format_standup(std::slice::from_ref(&run), now, 1800);
+        assert!(out.contains("1 task running"));
+        assert!(out.contains("competitor research"));
+        assert!(out.contains("checked 3/5 vendors"));
+        assert!(out.contains("10m")); // 630s rounds to 10m
+        // Fresh progress + short interval-relative age → not flagged stalled.
+        assert!(!out.contains("no recent progress"));
+    }
+
+    #[test]
+    fn test_format_standup_flags_stalled_task() {
+        use microclaw_storage::db::SubagentRunRecord;
+        let now = Utc::now();
+        // Running 90 min, no progress ever, interval 30 min → stalled.
+        let run = SubagentRunRecord {
+            run_id: "subrun-2".into(),
+            parent_run_id: None,
+            depth: 1,
+            chat_id: 7,
+            caller_channel: "telegram".into(),
+            task: "long grind".into(),
+            context: String::new(),
+            status: "running".into(),
+            created_at: (now - chrono::Duration::seconds(5400)).to_rfc3339(),
+            started_at: None,
+            finished_at: None,
+            cancel_requested: false,
+            error_text: None,
+            result_text: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            provider: "anthropic".into(),
+            model: "claude-test".into(),
+            token_budget: 0,
+            artifact_json: None,
+            label: Some("long grind".into()),
+            progress_text: None,
+            last_progress_at: None,
+        };
+        let out = format_standup(std::slice::from_ref(&run), now, 1800);
+        assert!(out.contains("no recent progress"), "expected stalled flag: {out}");
+    }
 
     #[test]
     fn test_parse_reflector_response_extracts_user_model() {

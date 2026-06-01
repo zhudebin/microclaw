@@ -17,10 +17,12 @@ pub mod mcp;
 pub mod memory;
 pub mod osv_check;
 pub mod read_file;
+pub mod report_progress;
 pub mod schedule;
 pub mod send_message;
 pub mod session_search;
 pub mod skill_manage;
+pub mod specialists;
 pub mod structured_memory;
 pub mod subagents;
 pub mod sync_skills;
@@ -437,7 +439,22 @@ impl ToolRegistry {
                     .with_cache(db.clone()),
             ),
             Box::new(fetch_artifact::FetchArtifactTool::new(db.clone())),
+            Box::new(describe_image::DescribeImageTool::new(config)),
         ];
+        // Visual creation + progress reporting: available to specialists whenever a
+        // channel registry is present, independent of session-spawn permissions.
+        if let Some(cr) = &channel_registry {
+            tools.push(Box::new(generate_image::GenerateImageTool::new(
+                config,
+                cr.clone(),
+                db.clone(),
+            )));
+            tools.push(Box::new(report_progress::ReportProgressTool::new(
+                config,
+                cr.clone(),
+                db.clone(),
+            )));
+        }
         if allow_session_tools {
             if let Some(channel_registry) = channel_registry {
                 tools.push(Box::new(subagents::SessionsSpawnTool::new(
